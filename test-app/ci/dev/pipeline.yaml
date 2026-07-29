@@ -1,0 +1,101 @@
+---
+resources:
+  - name: source
+    type: git
+    icon: github
+    source:
+      uri: ((repo))
+      branch: ((branch))
+      username: ((git.username))
+      password: ((git.password))
+      paths: ((git_paths))
+
+  # The moving candidate tag is updated only after the image passes Trivy.
+  - name: dev-image
+    type: registry-image
+    icon: docker
+    source:
+      repository: ((harbor.repository))/((dev_image))
+      tag: ((candidate_tag))
+      username: ((harbor.username))
+      password: ((harbor.password))
+
+jobs:
+  - name: build-scan-and-publish
+    serial: true
+    plan:
+      - get: source
+        trigger: true
+        version: every
+
+      - task: build-image
+        privileged: true
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: concourse/oci-build-task
+              tag: ((oci_build_task_tag))
+          inputs:
+            - name: source
+          outputs:
+            - name: image
+          caches:
+            - path: cache
+          params:
+            CONTEXT: source/((dockerfile_path))
+          run:
+            path: build
+
+      - task: scan-image
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: aquasec/trivy
+              tag: ((trivy_tag))
+          inputs:
+            - name: source
+            - name: image
+          outputs:
+            - name: scan-report
+            - name: image-tags
+          caches:
+            - path: trivy-cache
+          params:
+            TRIVY_CACHE_DIR: trivy-cache
+            TRIVY_SEVERITY: ((trivy_severity))
+          run:
+            path: /bin/sh
+            args:
+              - -ec
+              - |
+                git_ref="$(tr -d '\r\n' < source/.git/ref)"
+                if ! printf '%s\n' "${git_ref}" | grep -Eq '^[0-9a-f]{40}$'; then
+                  echo "Invalid dev Git SHA: ${git_ref}" >&2
+                  exit 1
+                fi
+
+                printf 'git-%s\n' "${git_ref}" > image-tags/tags
+
+                scan_status=0
+                trivy image \
+                  --input image/image.tar \
+                  --scanners vuln \
+                  --severity "${TRIVY_SEVERITY}" \
+                  --exit-code 1 \
+                  --no-progress \
+                  --format table \
+                  --output scan-report/trivy.txt || scan_status=$?
+
+                cat scan-report/trivy.txt
+                exit "${scan_status}"
+
+      # This step is never reached if Trivy finds a vulnerability at or above
+      # the configured severity threshold.
+      - put: dev-image
+        params:
+          image: image/image.tar
+          additional_tags: image-tags/tags

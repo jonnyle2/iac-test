@@ -1,0 +1,31 @@
+---
+# The Git resource triggers for every qualifying commit merged into main.
+repo: https://github.com/jonnyle2/test-app
+main_branch: main
+git_paths:
+  - home.html
+  - Dockerfile
+  - requirements.txt
+
+# For a two-parent merge commit, the pipeline promotes git-<second-parent SHA>,
+# which is the PR/hotfix branch head built before merging. For fast-forward,
+# squash, or rebase results it expects git-<resulting main SHA>; those strategies
+# therefore require the build pipeline to publish the post-merge commit.
+dev_image: test-app
+prod_image: test-app
+production_tag: prod
+
+# The SemVer resource persists release numbers in this Git repository/branch.
+version_repository: git@github.com:jonnyle2/iac-test.git
+version_branch: main
+
+# Crane resolves git-<SHA> to its digest and downloads the exact OCI image.
+# Tagged debug images include the shell required by the task.
+crane_repository: gcr.io/go-containerregistry/crane/debug
+crane_tag: v0.21.7
+
+# Allow time for the dev pipeline to finish publishing after a merge.
+candidate_wait_attempts: "30"
+candidate_wait_seconds: "10"
+
+busybox_tag: "1.37"

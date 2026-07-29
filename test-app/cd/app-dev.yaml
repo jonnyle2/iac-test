@@ -1,0 +1,18 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: test-app-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/my-repo/my-app.git'
+    targetRevision: dev
+    path: iac/test-app/cd/overlays/dev
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: jonny-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

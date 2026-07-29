@@ -1,0 +1,11 @@
+apiVersion: argocd-image-updater.argoproj.io/v1alpha1
+kind: ImageUpdater
+metadata:
+  name: test-app
+  namespace: jonny-dev
+spec:
+  applicationRefs:
+    - namePattern: "test-app"
+      images:
+        - alias: "test-app"
+          imageName: "test-app:0.0.1"

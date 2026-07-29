@@ -1,0 +1,179 @@
+---
+resources:
+  - name: main-source
+    type: git
+    icon: github
+    source:
+      uri: ((repo))
+      branch: ((main_branch))
+      username: ((git.username))
+      password: ((git.password))
+      paths: ((git_paths))
+
+  - name: prod-image
+    type: registry-image
+    icon: docker
+    source:
+      repository: ((harbor.repository))/((prod_image))
+      tag: ((production_tag))
+      username: ((harbor.username))
+      password: ((harbor.password))
+
+  - name: release-version
+    type: semver
+    icon: numeric
+    source:
+      driver: git
+      uri: ((version_repository))
+      branch: ((version_branch))
+      file: version
+      initial_version: 0.0.0
+      private_key: ((git.private_key))
+
+jobs:
+  - name: promote-to-production
+    serial: true
+    plan:
+      # Process every matching main commit in order, even if several arrive
+      # while this serial job is running.
+      - get: main-source
+        trigger: true
+        version: every
+
+      # Resolve the dev commit represented by the main update and fetch only
+      # the image tagged git-<that SHA>. A moving :dev tag is never selected.
+      - task: fetch-exact-dev-candidate
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ((crane_repository))
+              tag: ((crane_tag))
+          inputs:
+            - name: main-source
+          outputs:
+            - name: candidate-image
+            - name: candidate-metadata
+          params:
+            DEV_IMAGE_REPOSITORY: ((harbor.repository))/((dev_image))
+            HARBOR_USERNAME: ((harbor.username))
+            HARBOR_PASSWORD: ((harbor.password))
+            CANDIDATE_WAIT_ATTEMPTS: ((candidate_wait_attempts))
+            CANDIDATE_WAIT_SECONDS: ((candidate_wait_seconds))
+          run:
+            path: /busybox/sh
+            args:
+              - -ec
+              - |
+                main_sha="$(tr -d '\r\n' < main-source/.git/ref)"
+                if ! printf '%s\n' "${main_sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+                  echo "Invalid main Git SHA: ${main_sha}" >&2
+                  exit 1
+                fi
+
+                # A normal merge commit has:
+                #   $1 = merge commit, $2 = previous main, $3 = merged dev head.
+                # For a single-parent result, use the main SHA. Promotion will
+                # still fail unless the dev pipeline previously published that
+                # exact git-SHA tag.
+                set -- $(git rev-list --parents -n 1 "${main_sha}")
+                case "$#" in
+                  3)
+                    candidate_sha="$3"
+                    selection_reason="merged branch head (second parent)"
+                    ;;
+                  2)
+                    candidate_sha="${main_sha}"
+                    selection_reason="main commit (single-parent update)"
+                    ;;
+                  *)
+                    echo "Unsupported parent count for main commit ${main_sha}." >&2
+                    exit 1
+                    ;;
+                esac
+
+                candidate_tag="git-${candidate_sha}"
+                candidate_ref="${DEV_IMAGE_REPOSITORY}:${candidate_tag}"
+                registry_host="${DEV_IMAGE_REPOSITORY%%/*}"
+
+                printf '%s' "${HARBOR_PASSWORD}" |
+                  crane auth login "${registry_host}" \
+                    --username "${HARBOR_USERNAME}" \
+                    --password-stdin
+
+                # The prod Git resource and dev image publication are checked
+                # independently, so allow the dev pipeline a short time to
+                # finish publishing the SHA-tagged candidate.
+                attempt=1
+                candidate_digest=""
+                while [ "${attempt}" -le "${CANDIDATE_WAIT_ATTEMPTS}" ]; do
+                  if candidate_digest="$(crane digest "${candidate_ref}" 2>/dev/null)"; then
+                    break
+                  fi
+
+                  echo "Waiting for ${candidate_ref} (${attempt}/${CANDIDATE_WAIT_ATTEMPTS})"
+                  sleep "${CANDIDATE_WAIT_SECONDS}"
+                  attempt=$((attempt + 1))
+                done
+
+                if [ -z "${candidate_digest}" ]; then
+                  echo "No dev-built image exists for Git SHA ${candidate_sha}." >&2
+                  echo "Expected immutable tag: ${candidate_ref}" >&2
+                  exit 1
+                fi
+
+                # Resolve the tag once, then fetch by immutable digest. Extract
+                # an OCI layout so registry-image preserves that digest.
+                mkdir -p candidate-image/oci
+                crane pull \
+                  "${DEV_IMAGE_REPOSITORY}@${candidate_digest}" \
+                  /tmp/candidate-image.tar \
+                  --format=oci
+                tar -xf /tmp/candidate-image.tar -C candidate-image/oci
+
+                printf '%s\n' "${main_sha}" > candidate-metadata/main-sha
+                printf '%s\n' "${candidate_sha}" > candidate-metadata/dev-sha
+                printf '%s\n' "${candidate_tag}" > candidate-metadata/tags
+                printf '%s\n' "${candidate_digest}" > candidate-metadata/digest
+
+                echo "Main SHA: ${main_sha}"
+                echo "Candidate SHA: ${candidate_sha} (${selection_reason})"
+                echo "Candidate digest: ${candidate_digest}"
+
+      # Do not consume a release number until the exact dev candidate exists.
+      - put: release-version
+        params:
+          bump: patch
+
+      # The configured :prod tag, the semantic version, and git-<dev SHA> all
+      # point at the exact OCI manifest produced by the dev pipeline.
+      - put: prod-image
+        params:
+          image: candidate-image/oci
+          version: release-version/version
+          additional_tags: candidate-metadata/tags
+        get_params:
+          skip_download: true
+
+      - task: verify-promoted-digest
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: busybox
+              tag: ((busybox_tag))
+          inputs:
+            - name: candidate-metadata
+            - name: prod-image
+          run:
+            path: sh
+            args:
+              - -ec
+              - |
+                expected="$(tr -d '\r\n' < candidate-metadata/digest)"
+                actual="$(tr -d '\r\n' < prod-image/digest)"
+
+                test "${expected}" = "${actual}"
+                echo "Verified promoted digest ${actual}."

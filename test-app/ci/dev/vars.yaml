@@ -1,0 +1,18 @@
+---
+repo: https://github.com/jonnyle2/test-app
+branch: dev
+# list of files/folders that the resource tracks to trigger
+git_paths:
+  - home.html
+  - Dockerfile
+  - requirements.txt
+  # - src/**
+dockerfile_path: .
+
+dev_image: test-app
+candidate_tag: dev
+
+# Pin pipeline tooling to deliberate versions and update them through review.
+oci_build_task_tag: "0.15"
+trivy_tag: "0.72.0"
+trivy_severity: HIGH,CRITICAL
