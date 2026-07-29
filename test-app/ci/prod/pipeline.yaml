@@ -181,12 +181,18 @@ jobs:
         params:
           bump: patch
 
+      # Convert the SemVer resource's output file into a runtime value for the
+      # registry-image resource. Its version parameter does not accept a path.
+      - load_var: release_version
+        file: release-version/version
+        format: trim
+
       # The configured :prod tag, the semantic version, and git-<dev SHA> all
       # point at the exact OCI manifest produced by the dev pipeline.
       - put: prod-image
         params:
           image: candidate-image/oci
-          version: release-version/version
+          version: ((.:release_version))
           additional_tags: candidate-metadata/tags
         get_params:
           skip_download: true
