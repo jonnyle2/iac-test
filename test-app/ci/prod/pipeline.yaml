@@ -159,14 +159,13 @@ jobs:
                   exit 1
                 fi
 
-                # Resolve the tag once, then fetch by immutable digest. Extract
-                # an OCI layout so registry-image preserves that digest.
-                mkdir -p candidate-image/oci
+                # Resolve the tag once, then fetch by immutable digest. With
+                # --format=oci, Crane writes an OCI layout directory directly;
+                # the destination is not a tar archive.
                 crane pull \
                   "${DEV_IMAGE_REPOSITORY}@${candidate_digest}" \
-                  /tmp/candidate-image.tar \
+                  candidate-image/oci \
                   --format=oci
-                tar -xf /tmp/candidate-image.tar -C candidate-image/oci
 
                 printf '%s\n' "${main_sha}" > candidate-metadata/main-sha
                 printf '%s\n' "${candidate_sha}" > candidate-metadata/dev-sha
