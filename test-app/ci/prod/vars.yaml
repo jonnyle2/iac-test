@@ -19,6 +19,10 @@ production_tag: prod
 version_repository: git@github.com:jonnyle2/iac-test.git
 version_branch: main
 
+# Git is kept in its own task image; the Crane debug image does not include it.
+git_task_repository: alpine/git
+git_task_tag: "2.54.0"
+
 # Crane resolves git-<SHA> to its digest and downloads the exact OCI image.
 # Tagged debug images include the shell required by the task.
 crane_repository: gcr.io/go-containerregistry/crane/debug

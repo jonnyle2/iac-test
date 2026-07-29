@@ -40,8 +40,58 @@ jobs:
         trigger: true
         version: every
 
-      # Resolve the dev commit represented by the main update and fetch only
-      # the image tagged git-<that SHA>. A moving :dev tag is never selected.
+      # Crane's debug image intentionally contains Crane and BusyBox, but not
+      # Git. Resolve the commit relationship in a Git-equipped task first.
+      - task: resolve-candidate-sha
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: ((git_task_repository))
+              tag: ((git_task_tag))
+          inputs:
+            - name: main-source
+          outputs:
+            - name: candidate-selection
+          run:
+            path: /bin/sh
+            args:
+              - -ec
+              - |
+                main_sha="$(tr -d '\r\n' < main-source/.git/ref)"
+                if ! printf '%s\n' "${main_sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+                  echo "Invalid main Git SHA: ${main_sha}" >&2
+                  exit 1
+                fi
+
+                # Run Git inside the checked-out input. A normal merge has:
+                #   $1 = merge commit, $2 = previous main, $3 = merged dev head.
+                set -- $(git -C main-source rev-list --parents -n 1 "${main_sha}")
+                case "$#" in
+                  3)
+                    candidate_sha="$3"
+                    selection_reason="merged branch head (second parent)"
+                    ;;
+                  2)
+                    candidate_sha="${main_sha}"
+                    selection_reason="main commit (single-parent update)"
+                    ;;
+                  *)
+                    echo "Unsupported parent count ($#) for main commit ${main_sha}." >&2
+                    exit 1
+                    ;;
+                esac
+
+                printf '%s\n' "${main_sha}" > candidate-selection/main-sha
+                printf '%s\n' "${candidate_sha}" > candidate-selection/candidate-sha
+                printf '%s\n' "${selection_reason}" > candidate-selection/reason
+
+                echo "Main SHA: ${main_sha}"
+                echo "Candidate SHA: ${candidate_sha} (${selection_reason})"
+
+      # Fetch only the image tagged git-<resolved SHA>. A moving :dev tag is
+      # never selected.
       - task: fetch-exact-dev-candidate
         config:
           platform: linux
@@ -51,7 +101,7 @@ jobs:
               repository: ((crane_repository))
               tag: ((crane_tag))
           inputs:
-            - name: main-source
+            - name: candidate-selection
           outputs:
             - name: candidate-image
             - name: candidate-metadata
@@ -66,32 +116,18 @@ jobs:
             args:
               - -ec
               - |
-                main_sha="$(tr -d '\r\n' < main-source/.git/ref)"
+                main_sha="$(tr -d '\r\n' < candidate-selection/main-sha)"
+                candidate_sha="$(tr -d '\r\n' < candidate-selection/candidate-sha)"
+                selection_reason="$(cat candidate-selection/reason)"
+
                 if ! printf '%s\n' "${main_sha}" | grep -Eq '^[0-9a-f]{40}$'; then
                   echo "Invalid main Git SHA: ${main_sha}" >&2
                   exit 1
                 fi
-
-                # A normal merge commit has:
-                #   $1 = merge commit, $2 = previous main, $3 = merged dev head.
-                # For a single-parent result, use the main SHA. Promotion will
-                # still fail unless the dev pipeline previously published that
-                # exact git-SHA tag.
-                set -- $(git rev-list --parents -n 1 "${main_sha}")
-                case "$#" in
-                  3)
-                    candidate_sha="$3"
-                    selection_reason="merged branch head (second parent)"
-                    ;;
-                  2)
-                    candidate_sha="${main_sha}"
-                    selection_reason="main commit (single-parent update)"
-                    ;;
-                  *)
-                    echo "Unsupported parent count for main commit ${main_sha}." >&2
-                    exit 1
-                    ;;
-                esac
+                if ! printf '%s\n' "${candidate_sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+                  echo "Invalid candidate Git SHA: ${candidate_sha}" >&2
+                  exit 1
+                fi
 
                 candidate_tag="git-${candidate_sha}"
                 candidate_ref="${DEV_IMAGE_REPOSITORY}:${candidate_tag}"
