@@ -12,11 +12,11 @@ resources:
 
   # Images are first pushed under a temporary quarantine-<SHA> tag. Harbor
   # creates the immutable git-<SHA> tag only after its scanner passes the image.
-  - name: dev-image
+  - name: hotfix-image
     type: registry-image
     icon: docker
     source:
-      repository: ((harbor.repository))/((dev_image))
+      repository: ((harbor.repository))/((hotfix_image))
       username: ((harbor.username))
       password: ((harbor.password))
 
@@ -67,7 +67,7 @@ jobs:
               - |
                 git_ref="$(tr -d '\r\n' < source/.git/ref)"
                 if ! printf '%s\n' "${git_ref}" | grep -Eq '^[0-9a-f]{40}$'; then
-                  echo "Invalid dev Git SHA: ${git_ref}" >&2
+                  echo "Invalid hotfix Git SHA: ${git_ref}" >&2
                   exit 1
                 fi
 
@@ -75,7 +75,7 @@ jobs:
 
       # additional_tags without a resource-level tag pushes only the tag in the
       # file; registry-image does not add the default latest tag.
-      - put: dev-image
+      - put: hotfix-image
         params:
           image: image/image.tar
           additional_tags: image-tags/tags
@@ -96,7 +96,7 @@ jobs:
             - name: scan-report
           params:
             HARBOR_API_SCHEME: ((harbor_api_scheme))
-            IMAGE_REPOSITORY: ((harbor.repository))/((dev_image))
+            IMAGE_REPOSITORY: ((harbor.repository))/((hotfix_image))
             HARBOR_USERNAME: ((harbor.username))
             HARBOR_PASSWORD: ((harbor.password))
             SCAN_WAIT_ATTEMPTS: ((harbor_scan_wait_attempts))
@@ -139,7 +139,7 @@ jobs:
 
                 git_sha = pathlib.Path("source/.git/ref").read_text().strip()
                 if len(git_sha) != 40 or any(c not in "0123456789abcdef" for c in git_sha):
-                    raise SystemExit(f"Invalid dev Git SHA: {git_sha}")
+                    raise SystemExit(f"Invalid hotfix Git SHA: {git_sha}")
 
                 registry_host, separator, repository_path = image_repository.partition("/")
                 project, separator2, repository = repository_path.partition("/")

@@ -1,7 +1,7 @@
 ---
 repo: https://github.com/jonnyle2/test-app
-branch: dev
-# list of files/folders that the resource tracks to trigger
+branch: hotfix
+# List of files/folders that trigger a hotfix build.
 git_paths:
   - home.html
   - Dockerfile
@@ -9,7 +9,9 @@ git_paths:
   # - src/**
 dockerfile_path: .
 
-dev_image: test-app
+# Use the same Harbor repository as dev so production can promote either
+# pipeline's immutable git-<SHA> tag.
+hotfix_image: test-app
 
 # Pin pipeline tooling to deliberate versions and update them through review.
 oci_build_task_tag: "0.15"

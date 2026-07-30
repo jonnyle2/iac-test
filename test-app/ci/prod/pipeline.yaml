@@ -8,40 +8,33 @@ resources:
       branch: ((main_branch))
       username: ((git.username))
       password: ((git.password))
-      paths: ((git_paths))
 
-  - name: prod-image
-    type: registry-image
-    icon: docker
+  # Production promotion is an explicit release action. Only semantic-version
+  # Git tags are detected; ordinary commits to main do not trigger this job.
+  - name: release-source
+    type: git
+    icon: tag
     source:
-      repository: ((harbor.repository))/((prod_image))
-      tag: ((production_tag))
-      username: ((harbor.username))
-      password: ((harbor.password))
-
-  - name: release-version
-    type: semver
-    icon: numeric
-    source:
-      driver: git
-      uri: ((version_repository))
-      branch: ((version_branch))
-      file: version
-      initial_version: 0.0.0
-      private_key: ((git.private_key))
+      uri: ((repo))
+      version_type: tags
+      tag_regex: ((release_tag_regex))
+      tag_sort: version
+      username: ((git.username))
+      password: ((git.password))
 
 jobs:
   - name: promote-to-production
     serial: true
     plan:
-      # Process every matching main commit in order, even if several arrive
-      # while this serial job is running.
-      - get: main-source
+      # Process every matching release tag in semantic-version order.
+      - get: release-source
         trigger: true
         version: every
 
-      # Crane's debug image intentionally contains Crane and BusyBox, but not
-      # Git. Resolve the commit relationship in a Git-equipped task first.
+      # Used to prove that the tagged release commit belongs to main.
+      - get: main-source
+
+      # Resolve the commit relationship in a Git-equipped task.
       - task: resolve-candidate-sha
         config:
           platform: linux
@@ -52,73 +45,110 @@ jobs:
               tag: ((git_task_tag))
           inputs:
             - name: main-source
+            - name: release-source
           outputs:
             - name: candidate-selection
+          params:
+            RELEASE_TAG_PREFIX: ((release_tag_prefix))
+            RELEASE_TAG_REGEX: ((release_tag_regex))
           run:
             path: /bin/sh
             args:
               - -ec
               - |
-                main_sha="$(tr -d '\r\n' < main-source/.git/ref)"
-                if ! printf '%s\n' "${main_sha}" | grep -Eq '^[0-9a-f]{40}$'; then
-                  echo "Invalid main Git SHA: ${main_sha}" >&2
+                release_tag="$(tr -d '\r\n' < release-source/.git/tag)"
+                release_sha="$(tr -d '\r\n' < release-source/.git/ref)"
+                current_main_sha="$(tr -d '\r\n' < main-source/.git/ref)"
+
+                if ! printf '%s\n' "${release_tag}" |
+                  grep -Eq "${RELEASE_TAG_REGEX}"; then
+                  echo "Invalid release Git tag: ${release_tag}" >&2
+                  exit 1
+                fi
+                case "${release_tag}" in
+                  "${RELEASE_TAG_PREFIX}"*) ;;
+                  *)
+                    echo "Release tag ${release_tag} does not use prefix ${RELEASE_TAG_PREFIX}." >&2
+                    exit 1
+                    ;;
+                esac
+                release_version="${release_tag#"${RELEASE_TAG_PREFIX}"}"
+
+                for sha in "${release_sha}" "${current_main_sha}"; do
+                  if ! printf '%s\n' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+                    echo "Invalid Git SHA: ${sha}" >&2
+                    exit 1
+                  fi
+                done
+
+                if ! git -C main-source cat-file -e "${release_sha}^{commit}" 2>/dev/null ||
+                  ! git -C main-source merge-base --is-ancestor \
+                    "${release_sha}" "${current_main_sha}"; then
+                  echo "Release tag ${release_tag} (${release_sha}) is not on main." >&2
                   exit 1
                 fi
 
                 # Run Git inside the checked-out input. A normal merge has:
                 #   $1 = merge commit, $2 = previous main, $3 = merged dev head.
-                set -- $(git -C main-source rev-list --parents -n 1 "${main_sha}")
+                set -- $(git -C main-source rev-list --parents -n 1 "${release_sha}")
                 case "$#" in
                   3)
                     candidate_sha="$3"
                     selection_reason="merged branch head (second parent)"
                     ;;
                   2)
-                    candidate_sha="${main_sha}"
+                    candidate_sha="${release_sha}"
                     selection_reason="main commit (single-parent update)"
                     ;;
                   *)
-                    echo "Unsupported parent count ($#) for main commit ${main_sha}." >&2
+                    parent_count=$(($# - 1))
+                    echo "Unsupported parent count (${parent_count}) for release commit ${release_sha}." >&2
                     exit 1
                     ;;
                 esac
 
-                printf '%s\n' "${main_sha}" > candidate-selection/main-sha
+                printf '%s\n' "${release_sha}" > candidate-selection/main-sha
                 printf '%s\n' "${candidate_sha}" > candidate-selection/candidate-sha
                 printf '%s\n' "${selection_reason}" > candidate-selection/reason
+                printf '%s\n' "${release_tag}" > candidate-selection/release-tag
+                printf '%s\n' "${release_version}" > candidate-selection/release-version
 
-                echo "Main SHA: ${main_sha}"
+                echo "Release tag: ${release_tag}"
+                echo "Release version: ${release_version}"
+                echo "Main SHA: ${release_sha}"
                 echo "Candidate SHA: ${candidate_sha} (${selection_reason})"
 
-      # Fetch only the image tagged git-<resolved SHA>. A moving :dev tag is
-      # never selected.
-      - task: fetch-exact-dev-candidate
+      # Resolve the immutable git-<SHA> tag through Harbor's API. This verifies
+      # that the dev or hotfix build exists without downloading image layers.
+      - task: resolve-exact-built-candidate
         config:
           platform: linux
           image_resource:
             type: registry-image
             source:
-              repository: ((crane_repository))
-              tag: ((crane_tag))
+              repository: ((harbor_api_task_repository))
+              tag: ((harbor_api_task_tag))
           inputs:
             - name: candidate-selection
           outputs:
-            - name: candidate-image
             - name: candidate-metadata
           params:
-            DEV_IMAGE_REPOSITORY: ((harbor.repository))/((dev_image))
+            HARBOR_API_SCHEME: ((harbor_api_scheme))
+            CANDIDATE_IMAGE_REPOSITORY: ((harbor.repository))/((candidate_image))
             HARBOR_USERNAME: ((harbor.username))
             HARBOR_PASSWORD: ((harbor.password))
             CANDIDATE_WAIT_ATTEMPTS: ((candidate_wait_attempts))
             CANDIDATE_WAIT_SECONDS: ((candidate_wait_seconds))
           run:
-            path: /busybox/sh
+            path: /bin/sh
             args:
               - -ec
               - |
                 main_sha="$(tr -d '\r\n' < candidate-selection/main-sha)"
                 candidate_sha="$(tr -d '\r\n' < candidate-selection/candidate-sha)"
                 selection_reason="$(cat candidate-selection/reason)"
+                release_tag="$(tr -d '\r\n' < candidate-selection/release-tag)"
+                release_version="$(tr -d '\r\n' < candidate-selection/release-version)"
 
                 if ! printf '%s\n' "${main_sha}" | grep -Eq '^[0-9a-f]{40}$'; then
                   echo "Invalid main Git SHA: ${main_sha}" >&2
@@ -128,15 +158,35 @@ jobs:
                   echo "Invalid candidate Git SHA: ${candidate_sha}" >&2
                   exit 1
                 fi
+                if ! printf '%s\n' "${release_version}" |
+                  grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+                  echo "Invalid release version from Git tag ${release_tag}." >&2
+                  exit 1
+                fi
 
                 candidate_tag="git-${candidate_sha}"
-                candidate_ref="${DEV_IMAGE_REPOSITORY}:${candidate_tag}"
-                registry_host="${DEV_IMAGE_REPOSITORY%%/*}"
+                candidate_ref="${CANDIDATE_IMAGE_REPOSITORY}:${candidate_tag}"
+                registry_host="${CANDIDATE_IMAGE_REPOSITORY%%/*}"
+                repository_path="${CANDIDATE_IMAGE_REPOSITORY#*/}"
+                project="${repository_path%%/*}"
+                repository="${repository_path#*/}"
 
-                printf '%s' "${HARBOR_PASSWORD}" |
-                  crane auth login "${registry_host}" \
-                    --username "${HARBOR_USERNAME}" \
-                    --password-stdin
+                if [ "${repository_path}" = "${CANDIDATE_IMAGE_REPOSITORY}" ] ||
+                  [ "${repository}" = "${repository_path}" ]; then
+                  echo "CANDIDATE_IMAGE_REPOSITORY must use host/project/repository format." >&2
+                  exit 1
+                fi
+                case "${HARBOR_API_SCHEME}" in
+                  http|https) ;;
+                  *)
+                    echo "HARBOR_API_SCHEME must be http or https." >&2
+                    exit 1
+                    ;;
+                esac
+
+                # Harbor expects nested repository names to be URL encoded.
+                encoded_repository="$(printf '%s' "${repository}" | sed 's|/|%2F|g')"
+                artifact_url="${HARBOR_API_SCHEME}://${registry_host}/api/v2.0/projects/${project}/repositories/${encoded_repository}/artifacts/${candidate_tag}"
 
                 # The prod Git resource and dev image publication are checked
                 # independently, so allow the dev pipeline a short time to
@@ -144,77 +194,260 @@ jobs:
                 attempt=1
                 candidate_digest=""
                 while [ "${attempt}" -le "${CANDIDATE_WAIT_ATTEMPTS}" ]; do
-                  if candidate_digest="$(crane digest "${candidate_ref}" 2>/dev/null)"; then
-                    break
+                  if ! http_code="$(
+                    curl --silent --show-error \
+                      --connect-timeout 10 \
+                      --max-time 60 \
+                      --output /tmp/candidate-artifact.json \
+                      --write-out '%{http_code}' \
+                      --user "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" \
+                      --header 'Accept: application/json' \
+                      "${artifact_url}"
+                  )"; then
+                    echo "Harbor API request failed for ${candidate_ref}." >&2
+                    exit 1
                   fi
 
-                  echo "Waiting for ${candidate_ref} (${attempt}/${CANDIDATE_WAIT_ATTEMPTS})"
-                  sleep "${CANDIDATE_WAIT_SECONDS}"
-                  attempt=$((attempt + 1))
+                  case "${http_code}" in
+                    200)
+                      candidate_digest="$(
+                        tr -d '\r\n' < /tmp/candidate-artifact.json |
+                          grep -oE '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' |
+                          head -n 1 |
+                          cut -d '"' -f 4
+                      )"
+                      break
+                      ;;
+                    404|429|500|502|503|504)
+                      echo "Waiting for ${candidate_ref} (${attempt}/${CANDIDATE_WAIT_ATTEMPTS})"
+                      sleep "${CANDIDATE_WAIT_SECONDS}"
+                      attempt=$((attempt + 1))
+                      ;;
+                    *)
+                      echo "Harbor returned HTTP ${http_code} for ${candidate_ref}." >&2
+                      cat /tmp/candidate-artifact.json >&2
+                      exit 1
+                      ;;
+                  esac
                 done
 
-                if [ -z "${candidate_digest}" ]; then
-                  echo "No dev-built image exists for Git SHA ${candidate_sha}." >&2
+                if ! printf '%s\n' "${candidate_digest}" |
+                  grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                  echo "No dev or hotfix image exists for Git SHA ${candidate_sha}." >&2
                   echo "Expected immutable tag: ${candidate_ref}" >&2
                   exit 1
                 fi
 
-                # Resolve the tag once, then fetch by immutable digest. With
-                # --format=oci, Crane writes an OCI layout directory directly;
-                # the destination is not a tar archive.
-                crane pull \
-                  "${DEV_IMAGE_REPOSITORY}@${candidate_digest}" \
-                  candidate-image/oci \
-                  --format=oci
-
                 printf '%s\n' "${main_sha}" > candidate-metadata/main-sha
                 printf '%s\n' "${candidate_sha}" > candidate-metadata/dev-sha
-                printf '%s\n' "${candidate_tag}" > candidate-metadata/tags
+                printf '%s\n' "${candidate_tag}" > candidate-metadata/tag
                 printf '%s\n' "${candidate_digest}" > candidate-metadata/digest
+                printf '%s\n' "${release_tag}" > candidate-metadata/release-tag
+                printf '%s\n' "${release_version}" > candidate-metadata/release-version
 
+                echo "Release tag: ${release_tag}"
                 echo "Main SHA: ${main_sha}"
                 echo "Candidate SHA: ${candidate_sha} (${selection_reason})"
                 echo "Candidate digest: ${candidate_digest}"
 
-      # Do not consume a release number until the exact dev candidate exists.
-      - put: release-version
-        params:
-          bump: patch
-
-      # Convert the SemVer resource's output file into a runtime value for the
-      # registry-image resource. Its version parameter does not accept a path.
-      - load_var: release_version
-        file: release-version/version
-        format: trim
-
-      # The configured :prod tag, the semantic version, and git-<dev SHA> all
-      # point at the exact OCI manifest produced by the dev pipeline.
-      - put: prod-image
-        params:
-          image: candidate-image/oci
-          version: ((.:release_version))
-          additional_tags: candidate-metadata/tags
-        get_params:
-          skip_download: true
-
-      - task: verify-promoted-digest
+      # Add the immutable release tag directly to the existing Harbor artifact.
+      # No OCI layout or image layer crosses a worker.
+      - task: promote-with-harbor-api
         config:
           platform: linux
           image_resource:
             type: registry-image
             source:
-              repository: busybox
-              tag: ((busybox_tag))
+              repository: ((harbor_api_task_repository))
+              tag: ((harbor_api_task_tag))
           inputs:
             - name: candidate-metadata
-            - name: prod-image
+          params:
+            HARBOR_API_SCHEME: ((harbor_api_scheme))
+            CANDIDATE_IMAGE_REPOSITORY: ((harbor.repository))/((candidate_image))
+            HARBOR_USERNAME: ((harbor.username))
+            HARBOR_PASSWORD: ((harbor.password))
           run:
-            path: sh
+            path: /bin/sh
             args:
               - -ec
               - |
                 expected="$(tr -d '\r\n' < candidate-metadata/digest)"
-                actual="$(tr -d '\r\n' < prod-image/digest)"
+                candidate_tag="$(tr -d '\r\n' < candidate-metadata/tag)"
+                release_tag="$(tr -d '\r\n' < candidate-metadata/release-tag)"
+                release_version="$(tr -d '\r\n' < candidate-metadata/release-version)"
 
-                test "${expected}" = "${actual}"
-                echo "Verified promoted digest ${actual}."
+                if ! printf '%s\n' "${expected}" |
+                  grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                  echo "ERROR: invalid expected candidate digest: ${expected}" >&2
+                  exit 1
+                fi
+
+                registry_host="${CANDIDATE_IMAGE_REPOSITORY%%/*}"
+                repository_path="${CANDIDATE_IMAGE_REPOSITORY#*/}"
+                project="${repository_path%%/*}"
+                repository="${repository_path#*/}"
+
+                if [ "${repository_path}" = "${CANDIDATE_IMAGE_REPOSITORY}" ] ||
+                  [ "${repository}" = "${repository_path}" ]; then
+                  echo "Image repository must use host/project/repository format." >&2
+                  exit 1
+                fi
+                case "${HARBOR_API_SCHEME}" in
+                  http|https) ;;
+                  *)
+                    echo "HARBOR_API_SCHEME must be http or https." >&2
+                    exit 1
+                    ;;
+                esac
+
+                encoded_repository="$(printf '%s' "${repository}" | sed 's|/|%2F|g')"
+                api_base="${HARBOR_API_SCHEME}://${registry_host}/api/v2.0/projects/${project}/repositories/${encoded_repository}"
+                encoded_digest="$(printf '%s' "${expected}" | sed 's/:/%3A/g')"
+
+                parse_digest() {
+                  tr -d '\r\n' < /tmp/harbor-response.json |
+                    grep -oE '"digest"[[:space:]]*:[[:space:]]*"sha256:[0-9a-f]{64}"' |
+                    head -n 1 |
+                    cut -d '"' -f 4
+                }
+
+                get_artifact() {
+                  reference="${1}"
+                  if ! HTTP_CODE="$(
+                    curl --silent --show-error \
+                      --connect-timeout 10 \
+                      --max-time 60 \
+                      --output /tmp/harbor-response.json \
+                      --write-out '%{http_code}' \
+                      --user "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" \
+                      --header 'Accept: application/json' \
+                      "${api_base}/artifacts/${reference}"
+                  )"; then
+                    echo "Harbor API request failed for artifact ${reference}." >&2
+                    exit 1
+                  fi
+                  ARTIFACT_DIGEST=""
+                  if [ "${HTTP_CODE}" = "200" ]; then
+                    ARTIFACT_DIGEST="$(parse_digest)"
+                    if ! printf '%s\n' "${ARTIFACT_DIGEST}" |
+                      grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                      echo "Harbor returned an invalid artifact response for ${reference}." >&2
+                      cat /tmp/harbor-response.json >&2
+                      exit 1
+                    fi
+                  fi
+                }
+
+                create_tag() {
+                  tag="${1}"
+                  if ! create_code="$(
+                    curl --silent --show-error \
+                      --connect-timeout 10 \
+                      --max-time 60 \
+                      --output /tmp/harbor-response.json \
+                      --write-out '%{http_code}' \
+                      --user "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" \
+                      --request POST \
+                      --header 'Accept: application/json' \
+                      --header 'Content-Type: application/json' \
+                      --data "{\"name\":\"${tag}\"}" \
+                      "${api_base}/artifacts/${encoded_digest}/tags"
+                  )"; then
+                    echo "Harbor API failed while creating tag ${tag}." >&2
+                    exit 1
+                  fi
+
+                  case "${create_code}" in
+                    201)
+                      echo "Created tag ${tag} on ${expected}."
+                      ;;
+                    409)
+                      # A retry or concurrent actor may have created it. Verify
+                      # the current target rather than treating that as success.
+                      get_artifact "${tag}"
+                      if [ "${HTTP_CODE}" = "200" ] &&
+                        [ "${ARTIFACT_DIGEST}" = "${expected}" ]; then
+                        echo "Tag ${tag} already points to ${expected}."
+                      else
+                        echo "Harbor reported a conflict creating tag ${tag}." >&2
+                        cat /tmp/harbor-response.json >&2
+                        exit 1
+                      fi
+                      ;;
+                    *)
+                      echo "Harbor returned HTTP ${create_code} creating tag ${tag}." >&2
+                      cat /tmp/harbor-response.json >&2
+                      exit 1
+                      ;;
+                  esac
+                }
+
+                ensure_release_tag() {
+                  tag="${1}"
+
+                  if ! printf '%s\n' "${tag}" |
+                    grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'; then
+                    echo "Invalid OCI tag: ${tag}" >&2
+                    exit 1
+                  fi
+
+                  get_artifact "${tag}"
+                  case "${HTTP_CODE}" in
+                    200)
+                      if [ "${ARTIFACT_DIGEST}" = "${expected}" ]; then
+                        echo "Tag ${tag} already points to ${expected}."
+                        return
+                      fi
+                      echo "Immutable release tag ${tag} already points to another digest." >&2
+                      echo "Expected: ${expected}" >&2
+                      echo "Actual:   ${ARTIFACT_DIGEST}" >&2
+                      exit 1
+                      ;;
+                    404)
+                      create_tag "${tag}"
+                      ;;
+                    *)
+                      echo "Harbor returned HTTP ${HTTP_CODE} resolving tag ${tag}." >&2
+                      cat /tmp/harbor-response.json >&2
+                      exit 1
+                      ;;
+                  esac
+                }
+
+                # Confirm the immutable build tag still points to the digest
+                # selected before promotion began.
+                get_artifact "${candidate_tag}"
+                if [ "${HTTP_CODE}" != "200" ] ||
+                  [ "${ARTIFACT_DIGEST}" != "${expected}" ]; then
+                  echo "Candidate tag ${candidate_tag} changed or disappeared." >&2
+                  echo "Expected: ${expected}" >&2
+                  echo "Actual:   ${ARTIFACT_DIGEST:-not found}" >&2
+                  exit 1
+                fi
+
+                ensure_release_tag "${release_version}"
+
+                # Verify every relevant tag directly through Harbor.
+                mismatch=0
+                verify_tag() {
+                  tag="${1}"
+                  get_artifact "${tag}"
+                  actual="${ARTIFACT_DIGEST:-not found}"
+                  echo "${CANDIDATE_IMAGE_REPOSITORY}:${tag}: ${actual}"
+                  if [ "${HTTP_CODE}" != "200" ] ||
+                    [ "${actual}" != "${expected}" ]; then
+                    echo "ERROR: tag ${tag} does not point to ${expected}." >&2
+                    mismatch=1
+                  fi
+                }
+
+                echo "Expected candidate digest: ${expected}"
+                verify_tag "${candidate_tag}"
+                verify_tag "${release_version}"
+
+                if [ "${mismatch}" -ne 0 ]; then
+                  exit 1
+                fi
+
+                echo "Verified Git release ${release_tag} at ${expected}."

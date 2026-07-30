@@ -1,35 +1,27 @@
 ---
-# The Git resource triggers for every qualifying commit merged into main.
+# Production triggers only when a semantic-version Git tag is pushed.
 repo: https://github.com/jonnyle2/test-app
 main_branch: main
-git_paths:
-  - home.html
-  - Dockerfile
-  - requirements.txt
+release_tag_regex: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+release_tag_prefix: v
 
 # For a two-parent merge commit, the pipeline promotes git-<second-parent SHA>,
 # which is the PR/hotfix branch head built before merging. For fast-forward,
 # squash, or rebase results it expects git-<resulting main SHA>; those strategies
 # therefore require the build pipeline to publish the post-merge commit.
-dev_image: test-app
-prod_image: test-app
-production_tag: prod
+candidate_image: test-app
 
-# The SemVer resource persists release numbers in this Git repository/branch.
-version_repository: git@github.com:jonnyle2/iac-test.git
-version_branch: main
-
-# Git is kept in its own task image; the Crane debug image does not include it.
+# Git is kept in its own task image.
 git_task_repository: alpine/git
 git_task_tag: "2.54.0"
 
-# Crane resolves git-<SHA> to its digest and downloads the exact OCI image.
-# Tagged debug images include the shell required by the task.
-crane_repository: gcr.io/go-containerregistry/crane/debug
-crane_tag: v0.21.7
+# Harbor's API resolves the immutable candidate and creates the release tag
+# without downloading image layers. Change the scheme only for an HTTP Harbor
+# installation; HTTPS is strongly recommended.
+harbor_api_scheme: https
+harbor_api_task_repository: curlimages/curl
+harbor_api_task_tag: "8.21.0"
 
 # Allow time for the dev pipeline to finish publishing after a merge.
 candidate_wait_attempts: "30"
 candidate_wait_seconds: "10"
-
-busybox_tag: "1.37"
